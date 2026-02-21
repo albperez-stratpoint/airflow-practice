@@ -1,61 +1,98 @@
-## Installation 
+# Airflow Practice
 
-1. Install uv
+A local development setup for Apache Airflow with a clean separation between DAGs and pipeline logic. Designed for seamless deployment to AWS MWAA (Managed Workflows for Apache Airflow).
+
+## Overview
+
+This project demonstrates a production-ready Airflow project structure:
+
+- **`dags/`** - Contains Airflow DAG definitions (orchestration layer)
+- **`pipelines/`** - Contains reusable pipeline logic (business logic layer), packaged as a Python module
+
+## Development vs Deployment
+
+| Environment | `pipelines/` Setup |
+|-------------|-------------------|
+| **Local Dev** | Mounted as volume + added to `PYTHONPATH` via docker-compose |
+| **AWS MWAA** | Built as wheel from `pyproject.toml` and installed via `requirements.txt` |
+
+## Prerequisites
+
+- Docker and Docker Compose
+- [uv](https://github.com/astral-sh/uv) for Python package management (optional, for local development)
+
+## Quick Start
+
+### 1. Install uv (optional)
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-2. Create virtual environment and set python version
+### 2. Create virtual environment and set Python version
 
 ```bash
-uv venv --python 3.12
+uv venv --python 3.8.18
 ```
 
-3. Install dependencies
-
-```bash
-uv add apache-airflow==2.8.3
-```
-
-4. Export requirements to requirements.txt
-
-```bash
-uv export --format requirements.txt --output-file requirements.txt
-```
-
-5. Get official docker-compose file for Airflow 2.8.3 and optionally set `AIRFLOW__CORE__LOAD_EXAMPLES: 'false'`
+### 3. Get official docker-compose file for Airflow 2.8.3
 
 ```bash
 curl -LfO 'https://airflow.apache.org/docs/apache-airflow/2.8.3/docker-compose.yaml'
 ```
 
-6. Add AIRFLOW_UID to .env file
+Optionally set `AIRFLOW__CORE__LOAD_EXAMPLES: 'false'` in the compose file to disable example DAGs.
+
+### 4. Add AIRFLOW_UID to .env file
 
 ```bash
 echo -e "AIRFLOW_UID=$(id -u)" >> .env
 ```
 
-7. Start Airflow
+### 5. Start Airflow
 
 ```bash
 docker compose up -d
 ```
 
-8. Login to Airflow UI
+### 6. Access Airflow UI
 
-```bash
-http://localhost:8080
+Open http://localhost:8080 in your browser.
+
+**Default credentials:**
+- Username: `airflow`
+- Password: `airflow`
+
+## Project Structure
+
+```
+.
+├── dags/                     # Airflow DAG definitions
+│   └── sample_df_to_csv_dag.py
+├── pipelines/                # Reusable pipeline logic (Python package)
+│   ├── __init__.py
+│   └── df_to_csv.py
+├── pyproject.toml            # Package definition for pipelines
+└── docker-compose.yaml       # Local Airflow stack
 ```
 
-Default credentials:
-- Username: airflow
-- Password: airflow
+## Local Development
 
-9. Create dags.
+The `pipelines/` directory is mounted as a volume at `/opt/airflow/pipelines` in the containers, and the `PYTHONPATH` is configured to make the package discoverable. This allows you to edit pipeline code and see changes immediately without rebuilding images.
 
-## TODO
+## AWS MWAA Deployment (NOT YET TESTED)
 
-- [ ] Create dags.
-- [ ] Separate logic from dags into `pipelines/` directory. 
-- [ ] Make `pipelines/` installable as a package
+For production deployment to AWS MWAA:
+
+1. Build the `pipelines` package as a wheel:
+   ```bash
+   uv build --wheel
+   ```
+
+2. Upload the generated wheel (in `dist/`) to your MWAA S3 bucket
+
+3. Add the wheel to your `requirements.txt`:
+   ```
+   --find-links /usr/local/airflow/dags/wheels
+   pipelines==0.1.0
+   ```

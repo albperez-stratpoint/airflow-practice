@@ -1,9 +1,14 @@
 [project]
-name = "airflow-practice"
+name = "pipelines"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = "==3.8.18"
 dependencies = [
-    "apache-airflow==2.8.3",
+    "pandas==2.0.3"
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.2",
 ]
