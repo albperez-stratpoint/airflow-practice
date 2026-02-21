@@ -80,6 +80,18 @@ Open http://localhost:8080 in your browser.
 
 The `pipelines/` directory is mounted as a volume at `/opt/airflow/pipelines` in the containers, and the `PYTHONPATH` is configured to make the package discoverable. This allows you to edit pipeline code and see changes immediately without rebuilding images.
 
+### Linting
+
+Before committing changes, run the linter to ensure code quality:
+
+```bash
+make lint
+```
+
+This runs `ruff` to check and auto-fix imports, format code, and fix linting issues.
+
+A linting check is also enforced in CI on every push and pull request.
+
 ## AWS MWAA Deployment (NOT YET TESTED)
 
 For production deployment to AWS MWAA:
