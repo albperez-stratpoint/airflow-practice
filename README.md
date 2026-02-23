@@ -43,19 +43,37 @@ curl -LfO 'https://airflow.apache.org/docs/apache-airflow/2.8.3/docker-compose.y
 
 Optionally set `AIRFLOW__CORE__LOAD_EXAMPLES: 'false'` in the compose file to disable example DAGs.
 
-### 4. Add AIRFLOW_UID to .env file
+We will also use custom image so we need do the follow:
+
+```yaml
+# Comment this
+# image: ${AIRFLOW_IMAGE_NAME:-apache/airflow:2.8.3}
+
+# Uncomment this
+build: .
+```
+
+We do this since we need to add additional dependencies, though we could populate `    _PIP_ADDITIONAL_REQUIREMENTS: ${_PIP_ADDITIONAL_REQUIREMENTS:-}`.
+
+### 4. Import dependencies to `requirements.txt` which is used in `Dockerfile`.
+
+```bash
+uv export --format requirements-txt > requirements.txt
+```
+
+### 5. Add AIRFLOW_UID to .env file
 
 ```bash
 echo -e "AIRFLOW_UID=$(id -u)" >> .env
 ```
 
-### 5. Start Airflow
+### 6. Start Airflow
 
 ```bash
 docker compose up -d
 ```
 
-### 6. Access Airflow UI
+### 7. Access Airflow UI
 
 Open http://localhost:8080 in your browser.
 
