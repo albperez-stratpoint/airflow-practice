@@ -73,7 +73,37 @@ echo -e "AIRFLOW_UID=$(id -u)" >> .env
 docker compose up -d
 ```
 
-### 7. Access Airflow UI
+### 7. Reuse postgres service for data warehouse
+
+```bash
+--0. Connect to the existing PostgreSQL container
+docker-compose exec postgres psql -U airflow
+
+-- 1. Create a separate database for the DWH (optional; you can also use 'airflow' DB)
+CREATE DATABASE dwh;
+
+-- 2. Create a dedicated DWH user
+CREATE USER dwh_user WITH PASSWORD 'dwh_pass';
+
+-- 3. Grant all privileges on the new database to the DWH user
+GRANT ALL PRIVILEGES ON DATABASE dwh TO dwh_user;
+
+-- 4. Connect to the DWH database
+\c dwh
+
+-- 5. Create a dedicated schema (optional but recommended)
+CREATE SCHEMA dwh_schema AUTHORIZATION dwh_user;
+
+-- 6. Grant privileges on the schema
+GRANT USAGE ON SCHEMA dwh_schema TO dwh_user;
+GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA dwh_schema TO dwh_user;
+ALTER DEFAULT PRIVILEGES IN SCHEMA dwh_schema GRANT ALL ON TABLES TO dwh_user;
+
+-- 7. Verify the schema
+\dn
+```
+
+### 8. Access Airflow UI
 
 Open http://localhost:8080 in your browser.
 
