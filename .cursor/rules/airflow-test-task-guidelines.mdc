@@ -1,0 +1,12 @@
+---
+description: Testing guidelines for Apache Airflow DAG tasks and Python functions in this project.
+globs: tests/**/*.py
+alwaysApply: false
+---
+
+# Guidelines for writing tests for Airflow tasks
+
+- Use `pytest`.
+- Every DAG in the `dags` folder should have a dedicated folder with its unit tests.
+- Every DAG should comply with the tests defined in `@checker.py`.
+

@@ -1,0 +1,20 @@
+---
+description: Naming and structure guidelines for include folder artifacts (SQL, bash, etc.) in this Airflow project.
+globs: include/**
+alwaysApply: false
+---
+
+# Guidelines for files in the include folder
+
+- A file with a SQL request should be named in uppercase with the `.sql` extension. The first part of the name must be what the SQL request does such as `CREATE`, `INSERT`, `UPDATE`, `DELETE`.
+
+**Good Example:**
+```text
+CREATE_MY_REQUEST.sql
+```
+
+**Bad Example:**
+```text
+my_request.txt
+```
+
