@@ -3,12 +3,13 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 
-from airflow import DAG
 from airflow.decorators import task
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 
+from airflow import DAG
+
 CSV_PATH = Path("/opt/airflow/data/raw/olist_customers_dataset.csv")
-TABLE_NAME = "ecommerce_customer_staging"
+TABLE_NAME = "dwh.ecommerce_customer_staging"
 
 with DAG(
     dag_id="customer_pipeline_simple",

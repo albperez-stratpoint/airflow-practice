@@ -75,11 +75,13 @@ docker compose up -d
 
 ### 7. Reuse postgres service for data warehouse
 
-```bash
---0. Connect to the existing PostgreSQL container
-docker-compose exec postgres psql -U airflow
+Create a separate `dwh` database and schema so the DAG can create staging tables. Set the connection in `.env` (see end of step).
 
--- 1. Create a separate database for the DWH (optional; you can also use 'airflow' DB)
+```bash
+# 0. Connect to the existing PostgreSQL container
+docker compose exec postgres psql -U airflow
+
+-- 1. Create a separate database for the DWH
 CREATE DATABASE dwh;
 
 -- 2. Create a dedicated DWH user
@@ -92,15 +94,21 @@ GRANT ALL PRIVILEGES ON DATABASE dwh TO dwh_user;
 \c dwh
 
 -- 5. Create a dedicated schema (optional but recommended)
-CREATE SCHEMA dwh_schema AUTHORIZATION dwh_user;
+CREATE SCHEMA dwh AUTHORIZATION dwh_user;
 
 -- 6. Grant privileges on the schema
-GRANT USAGE ON SCHEMA dwh_schema TO dwh_user;
-GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA dwh_schema TO dwh_user;
-ALTER DEFAULT PRIVILEGES IN SCHEMA dwh_schema GRANT ALL ON TABLES TO dwh_user;
+GRANT USAGE ON SCHEMA dwh TO dwh_user;
+GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA dwh TO dwh_user;
+ALTER DEFAULT PRIVILEGES IN SCHEMA dwh GRANT ALL ON TABLES TO dwh_user;
 
 -- 7. Verify the schema
 \dn
+```
+
+Ensure `.env` contains the DWH connection (database `dwh`):
+
+```bash
+AIRFLOW_CONN_POSTGRES_DWH=postgresql://dwh_user:dwh_pass@postgres:5432/dwh?options=-csearch_path%3Ddwh
 ```
 
 ### 8. Access Airflow UI
@@ -115,8 +123,13 @@ Open http://localhost:8080 in your browser.
 
 ```
 .
-├── dags/                     # Airflow DAG definitions
-│   └── sample_df_to_csv_dag.py
+├── airflow/
+│   ├── dags/                 # Airflow DAG definitions
+│   │   ├── customer_dag.py
+│   │   ├── sample_df_to_csv_dag.py
+│   │   └── test_env_dag.py
+│   └── plugins/              # Custom Airflow plugins (optional)
+├── src/                      # Application code (if needed)
 ├── pipelines/                # Reusable pipeline logic (Python package)
 │   ├── __init__.py
 │   └── df_to_csv.py
