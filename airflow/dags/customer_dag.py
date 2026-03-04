@@ -1,78 +1,203 @@
+"""E-commerce customer MDM pipeline: staging -> Splink deduplication -> master table."""
+
 from __future__ import annotations
 
+import io
+import logging
 from datetime import datetime
 from pathlib import Path
 
+import pandas as pd
 from airflow.decorators import task
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 
 from airflow import DAG
+from mdm.deduplicate import run_deduplication
+
+logger = logging.getLogger(__name__)
 
 CSV_PATH = Path("/opt/airflow/data/raw/olist_customers_dataset.csv")
-TABLE_NAME = "dwh.ecommerce_customer_staging"
+STAGING_TABLE = "dwh.ecommerce_customer_staging"
+MASTER_TABLE = "dwh.ecommerce_customer_master"
+
+# Default source system when loading from Olist CSV (per instructions: MDM simulation).
+SOURCE_SYSTEM_OLIST = "olist"
+
+# CSV column -> staging table column mapping.
+CSV_TO_STAGING_COLUMNS = {
+    "customer_zip_code_prefix": "zip_code_prefix",
+    "customer_city": "city",
+    "customer_state": "state",
+}
+STAGING_COLUMN_ORDER = (
+    "source_system",
+    "customer_id",
+    "customer_unique_id",
+    "zip_code_prefix",
+    "city",
+    "state",
+)
+
+# Optional CSV-style column names in staging (if table was created from CSV headers).
+STAGING_COLUMN_ALIASES = {
+    "customer_zip_code_prefix": "zip_code_prefix",
+    "customer_city": "city",
+    "customer_state": "state",
+}
+
 
 with DAG(
     dag_id="customer_pipeline_simple",
     start_date=datetime(2024, 1, 1),
     schedule="@daily",
     catchup=False,
-    tags=["customer", "ecommerce"],
+    tags=["customer", "ecommerce", "mdm"],
 ) as dag:
 
     @task
-    def create_table():
-        """Create the staging table (fixed schema)."""
+    def create_staging_table() -> str:
+        """Create staging table per instructions (source_system, customer_id, ...)."""
+        hook = PostgresHook(postgres_conn_id="postgres_dwh")
+        hook.run("CREATE SCHEMA IF NOT EXISTS dwh")
+        hook.run(f"DROP TABLE IF EXISTS {STAGING_TABLE}")
         create_sql = f"""
-        CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
+        CREATE TABLE {STAGING_TABLE} (
+            source_system TEXT,
             customer_id TEXT,
             customer_unique_id TEXT,
-            customer_zip_code_prefix TEXT,
-            customer_city TEXT,
-            customer_state TEXT
+            zip_code_prefix INTEGER,
+            city TEXT,
+            state TEXT
         );
         """
-        postgres_hook = PostgresHook(postgres_conn_id="postgres_dwh")
-        postgres_hook.run(create_sql)
-        return f"Table {TABLE_NAME} created"
+        hook.run(create_sql)
+        return f"Table {STAGING_TABLE} created"
 
     @task
-    def load_csv():
-        """Load CSV into Postgres using COPY."""
-        postgres_hook = PostgresHook(postgres_conn_id="postgres_dwh")
-        conn = postgres_hook.get_conn()
+    def load_csv_to_staging() -> str:
+        """Load CSV into Postgres using COPY. Maps CSV columns to staging schema."""
+        if not CSV_PATH.exists():
+            raise FileNotFoundError(f"CSV not found: {CSV_PATH}")
+
+        df = pd.read_csv(
+            CSV_PATH,
+            dtype={
+                "customer_id": str,
+                "customer_unique_id": str,
+                "customer_zip_code_prefix": "Int64",
+                "customer_city": str,
+                "customer_state": str,
+            },
+        )
+        df = df.rename(columns=CSV_TO_STAGING_COLUMNS)
+        df.insert(0, "source_system", SOURCE_SYSTEM_OLIST)
+        df = df[list(STAGING_COLUMN_ORDER)]
+
+        hook = PostgresHook(postgres_conn_id="postgres_dwh")
+        conn = hook.get_conn()
         cursor = conn.cursor()
-
-        copy_sql = f"""
-        COPY {TABLE_NAME} (
-            customer_id, 
-            customer_unique_id, 
-            customer_zip_code_prefix, 
-            customer_city, 
-        customer_state)
-        FROM STDIN WITH CSV HEADER DELIMITER ',';
-        """
-
-        with open(CSV_PATH, "r", encoding="utf-8") as f:
-            cursor.copy_expert(sql=copy_sql, file=f)
-
+        buffer = io.StringIO()
+        df.to_csv(buffer, index=False, header=False, na_rep="\\N")
+        buffer.seek(0)
+        columns_str = ", ".join(STAGING_COLUMN_ORDER)
+        cursor.copy_expert(
+            f"COPY {STAGING_TABLE} ({columns_str}) FROM STDIN WITH (FORMAT csv, NULL '\\N')",
+            buffer,
+        )
         conn.commit()
         cursor.close()
-        return f"Loaded {CSV_PATH.name} into {TABLE_NAME}"
+        conn.close()
+        logger.info("Loaded %d rows from %s into %s", len(df), CSV_PATH, STAGING_TABLE)
+        return f"Loaded {len(df)} rows into {STAGING_TABLE}"
 
     @task
-    def process_data():
-        """Count customers by state."""
-        postgres_hook = PostgresHook(postgres_conn_id="postgres_dwh")
-        result_sql = f"""
-        SELECT customer_state, COUNT(*) as customer_count
-        FROM {TABLE_NAME}
-        GROUP BY customer_state
-        ORDER BY customer_count DESC;
+    def create_master_table() -> str:
+        """Create customer master table per instructions."""
+        create_sql = f"""
+        CREATE TABLE IF NOT EXISTS {MASTER_TABLE} (
+            master_customer_id UUID PRIMARY KEY,
+            customer_unique_id TEXT,
+            zip_code_prefix INTEGER,
+            city TEXT,
+            state TEXT,
+            source_count INT,
+            created_at TIMESTAMP DEFAULT NOW()
+        );
         """
-        results = postgres_hook.get_records(result_sql)
-        for state, count in results:
-            print(f"{state}: {count}")
-        return results
+        hook = PostgresHook(postgres_conn_id="postgres_dwh")
+        hook.run(create_sql)
+        return f"Table {MASTER_TABLE} created"
 
-    # Task dependencies
-    create_table() >> load_csv() >> process_data()
+    @task
+    def run_deduplication_and_persist() -> str:
+        """Read staging, run Splink deduplication, persist master records to Postgres."""
+        hook = PostgresHook(postgres_conn_id="postgres_dwh")
+        staging_df = hook.get_pandas_df(f"SELECT * FROM {STAGING_TABLE}")
+
+        if staging_df.empty:
+            logger.warning("Staging table is empty; skipping deduplication.")
+            return "No staging data to deduplicate"
+
+        # Normalize column names: support both canonical (zip_code_prefix, city, state)
+        # and CSV-style (customer_zip_code_prefix, customer_city, customer_state).
+        rename_map = {
+            src: dest
+            for src, dest in STAGING_COLUMN_ALIASES.items()
+            if src in staging_df.columns and dest not in staging_df.columns
+        }
+        if rename_map:
+            staging_df = staging_df.rename(columns=rename_map)
+
+        required_columns = [
+            "customer_id",
+            "customer_unique_id",
+            "zip_code_prefix",
+            "city",
+            "state",
+        ]
+        missing = [c for c in required_columns if c not in staging_df.columns]
+        if missing:
+            raise ValueError(
+                f"Staging table {STAGING_TABLE} missing required columns: {missing}. "
+                f"Present: {list(staging_df.columns)}"
+            )
+        staging_df = staging_df[required_columns]
+
+        master_records = run_deduplication(staging_df)
+
+        schema, table_name = MASTER_TABLE.split(".")
+        conn = hook.get_conn()
+        cursor = conn.cursor()
+
+        # Idempotent: truncate master then insert this run's results.
+        cursor.execute(f"TRUNCATE TABLE {MASTER_TABLE}")
+
+        insert_sql = f"""
+        INSERT INTO {MASTER_TABLE}
+            (master_customer_id, customer_unique_id, zip_code_prefix, city, state, source_count)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        """
+        for rec in master_records:
+            cursor.execute(
+                insert_sql,
+                (
+                    str(rec["master_customer_id"]),
+                    rec["customer_unique_id"],
+                    rec["zip_code_prefix"],
+                    rec["city"],
+                    rec["state"],
+                    rec["source_count"],
+                ),
+            )
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return f"Persisted {len(master_records)} master records to {MASTER_TABLE}"
+
+    # Pipeline: create tables -> load CSV -> create master table -> deduplicate and persist.
+    (
+        create_staging_table()
+        >> load_csv_to_staging()
+        >> create_master_table()
+        >> run_deduplication_and_persist()
+    )
