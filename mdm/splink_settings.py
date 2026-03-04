@@ -11,6 +11,21 @@ CITY_COLUMN = "city"
 STATE_COLUMN = "state"
 ZIP_COLUMN = "zip_code_prefix"
 
+# Number of leading digits of zip used in blocking (reduces comparison space and memory).
+# 0 = full zip match (smallest blocks); 2 = first 2 digits; etc.
+ZIP_PREFIX_BLOCKING_DIGITS = 0
+
+
+def _blocking_rule_state_zip() -> str:
+    """Blocking rule: state + zip (full zip if ZIP_PREFIX_BLOCKING_DIGITS is 0, else prefix)."""
+    if ZIP_PREFIX_BLOCKING_DIGITS <= 0:
+        return f"l.{STATE_COLUMN} = r.{STATE_COLUMN} AND l.{ZIP_COLUMN} = r.{ZIP_COLUMN}"
+    return (
+        f"l.{STATE_COLUMN} = r.{STATE_COLUMN} AND "
+        f"substr(l.{ZIP_COLUMN}::VARCHAR, 1, {ZIP_PREFIX_BLOCKING_DIGITS}) = "
+        f"substr(r.{ZIP_COLUMN}::VARCHAR, 1, {ZIP_PREFIX_BLOCKING_DIGITS})"
+    )
+
 
 def get_splink_settings() -> dict:
     """Return Splink settings dict for probabilistic customer deduplication.
@@ -23,7 +38,8 @@ def get_splink_settings() -> dict:
         "unique_id_column_name": UNIQUE_ID_COLUMN,
         "sql_dialect": "duckdb",
         "blocking_rules_to_generate_predictions": [
-            f"l.{STATE_COLUMN} = r.{STATE_COLUMN}",
+            # Block on state + zip (full or prefix) to keep blocks small (avoids OOM).
+            _blocking_rule_state_zip(),
         ],
         "comparisons": [
             {

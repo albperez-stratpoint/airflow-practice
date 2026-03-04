@@ -57,6 +57,7 @@ with DAG(
     @task
     def create_staging_table() -> str:
         """Create staging table per instructions (source_system, customer_id, ...)."""
+        logger.info("Creating schema and staging table %s", STAGING_TABLE)
         hook = PostgresHook(postgres_conn_id="postgres_dwh")
         hook.run("CREATE SCHEMA IF NOT EXISTS dwh")
         hook.run(f"DROP TABLE IF EXISTS {STAGING_TABLE}")
@@ -71,11 +72,13 @@ with DAG(
         );
         """
         hook.run(create_sql)
+        logger.info("Table %s created successfully", STAGING_TABLE)
         return f"Table {STAGING_TABLE} created"
 
     @task
     def load_csv_to_staging() -> str:
         """Load CSV into Postgres using COPY. Maps CSV columns to staging schema."""
+        logger.info("Reading CSV from %s", CSV_PATH)
         if not CSV_PATH.exists():
             raise FileNotFoundError(f"CSV not found: {CSV_PATH}")
 
@@ -96,6 +99,7 @@ with DAG(
         hook = PostgresHook(postgres_conn_id="postgres_dwh")
         conn = hook.get_conn()
         cursor = conn.cursor()
+        logger.info("Copying %d rows into %s", len(df), STAGING_TABLE)
         buffer = io.StringIO()
         df.to_csv(buffer, index=False, header=False, na_rep="\\N")
         buffer.seek(0)
@@ -113,6 +117,7 @@ with DAG(
     @task
     def create_master_table() -> str:
         """Create customer master table per instructions."""
+        logger.info("Creating master table %s", MASTER_TABLE)
         create_sql = f"""
         CREATE TABLE IF NOT EXISTS {MASTER_TABLE} (
             master_customer_id UUID PRIMARY KEY,
@@ -126,17 +131,21 @@ with DAG(
         """
         hook = PostgresHook(postgres_conn_id="postgres_dwh")
         hook.run(create_sql)
+        logger.info("Master table %s ready", MASTER_TABLE)
         return f"Table {MASTER_TABLE} created"
 
     @task
     def run_deduplication_and_persist() -> str:
         """Read staging, run Splink deduplication, persist master records to Postgres."""
         hook = PostgresHook(postgres_conn_id="postgres_dwh")
+        logger.info("Reading staging data from %s", STAGING_TABLE)
         staging_df = hook.get_pandas_df(f"SELECT * FROM {STAGING_TABLE}")
 
         if staging_df.empty:
             logger.warning("Staging table is empty; skipping deduplication.")
             return "No staging data to deduplicate"
+
+        logger.info("Staging row count: %d", len(staging_df))
 
         # Normalize column names: support both canonical (zip_code_prefix, city, state)
         # and CSV-style (customer_zip_code_prefix, customer_city, customer_state).
@@ -147,6 +156,7 @@ with DAG(
         }
         if rename_map:
             staging_df = staging_df.rename(columns=rename_map)
+            logger.debug("Renamed columns: %s", rename_map)
 
         required_columns = [
             "customer_id",
@@ -163,13 +173,16 @@ with DAG(
             )
         staging_df = staging_df[required_columns]
 
+        logger.info("Running Splink deduplication on %d rows", len(staging_df))
         master_records = run_deduplication(staging_df)
+        logger.info("Deduplication returned %d master records", len(master_records))
 
         schema, table_name = MASTER_TABLE.split(".")
         conn = hook.get_conn()
         cursor = conn.cursor()
 
         # Idempotent: truncate master then insert this run's results.
+        logger.info("Truncating %s and inserting %d records", MASTER_TABLE, len(master_records))
         cursor.execute(f"TRUNCATE TABLE {MASTER_TABLE}")
 
         insert_sql = f"""
@@ -192,6 +205,7 @@ with DAG(
         conn.commit()
         cursor.close()
         conn.close()
+        logger.info("Persisted %d master records to %s", len(master_records), MASTER_TABLE)
         return f"Persisted {len(master_records)} master records to {MASTER_TABLE}"
 
     # Pipeline: create tables -> load CSV -> create master table -> deduplicate and persist.

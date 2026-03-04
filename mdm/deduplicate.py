@@ -22,6 +22,9 @@ logger = logging.getLogger(__name__)
 # Match probability threshold for clustering (pairs above this are same entity).
 DEFAULT_MATCH_PROBABILITY_THRESHOLD = 0.5
 
+# Max pairs for u-probability random sampling; lower value reduces memory use (e.g. in Docker).
+U_ESTIMATION_MAX_PAIRS = 100_000
+
 
 def run_deduplication(
     staging_df: pd.DataFrame,
@@ -43,18 +46,35 @@ def run_deduplication(
         logger.warning("Staging dataframe is empty; returning no master records.")
         return []
 
+    num_staging = len(staging_df)
+    logger.info(
+        "Starting deduplication: %d staging rows, match_threshold=%.2f",
+        num_staging,
+        match_probability_threshold,
+    )
+
     settings = get_splink_settings()
     db_api = DuckDBAPI()
     linker = Linker(staging_df, settings, db_api=db_api)
+    logger.info("Linker created with DuckDB backend")
 
     # Optionally improve u probabilities; fixed m/u in settings are used otherwise.
-    linker.training.estimate_u_using_random_sampling(max_pairs=500_000)
+    # Use a moderate sample to avoid OOM in constrained environments (e.g. Docker).
+    linker.training.estimate_u_using_random_sampling(max_pairs=U_ESTIMATION_MAX_PAIRS)
+    logger.info("U probabilities estimated (max_pairs=%d)", U_ESTIMATION_MAX_PAIRS)
 
     predictions = linker.inference.predict(threshold_match_probability=match_probability_threshold)
-    predictions_df = predictions.as_pandas_dataframe()
 
-    if predictions_df.empty:
-        # No pairs above threshold: every record is its own cluster.
+    # Avoid materializing full predictions table; check count via SQL to save memory.
+    count_df = linker.misc.query_sql(f"SELECT COUNT(*) AS n FROM {predictions.physical_name}")
+    num_pairs = int(count_df["n"].iloc[0])
+    logger.info("Pairwise predictions generated: %d pairs", num_pairs)
+
+    if num_pairs == 0:
+        logger.info(
+            "No pairs above threshold; treating each of %d rows as singleton cluster",
+            num_staging,
+        )
         return _staging_rows_to_master_records(staging_df)
 
     unique_id_col = settings["unique_id_column_name"]
@@ -64,6 +84,7 @@ def run_deduplication(
         predictions, threshold_match_probability=match_probability_threshold
     )
     clusters_df = clusters_sdf.as_pandas_dataframe()
+    logger.info("Clustering completed: %d cluster assignments", len(clusters_df))
 
     # Detect cluster id column name (Splink may use different naming).
     cluster_id_col = "cluster_id"
@@ -76,6 +97,8 @@ def run_deduplication(
     if len(clusters_df) < len(all_ids):
         clustered_ids = set(clusters_df[unique_id_col])
         singleton_ids = all_ids[~all_ids.isin(clustered_ids)]
+        num_singletons = len(singleton_ids)
+        logger.info("Adding %d singletons not present in clustering result", num_singletons)
         next_id = int(clusters_df[cluster_id_col].max()) + 1
         singletons_df = pd.DataFrame(
             {
@@ -104,11 +127,22 @@ def run_deduplication(
             }
         )
 
+    num_clusters = len(master_records)
+    num_merged = sum(1 for r in master_records if r["source_count"] > 1)
+    logger.info(
+        "Deduplication complete: %d master records (%d clusters with multiple sources)",
+        num_clusters,
+        num_merged,
+    )
     return master_records
 
 
 def _staging_rows_to_master_records(staging_df: pd.DataFrame) -> list[dict[str, Any]]:
     """When there are no pairwise matches, treat each row as its own cluster."""
+    logger.info(
+        "Building %d master records (one per staging row, no merges)",
+        len(staging_df),
+    )
     return [
         {
             "master_customer_id": uuid.uuid4(),
