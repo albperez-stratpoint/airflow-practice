@@ -191,15 +191,16 @@ with DAG(
         VALUES (%s, %s, %s, %s, %s, %s)
         """
         for rec in master_records:
+            # Convert numpy types to native Python so psycopg2 can adapt them.
             cursor.execute(
                 insert_sql,
                 (
                     str(rec["master_customer_id"]),
-                    rec["customer_unique_id"],
-                    rec["zip_code_prefix"],
-                    rec["city"],
-                    rec["state"],
-                    rec["source_count"],
+                    str(rec["customer_unique_id"]),
+                    int(rec["zip_code_prefix"]) if rec["zip_code_prefix"] is not None else None,
+                    str(rec["city"]) if rec["city"] is not None else None,
+                    str(rec["state"]) if rec["state"] is not None else None,
+                    int(rec["source_count"]),
                 ),
             )
         conn.commit()
