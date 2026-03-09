@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "duckdb>=1.4.4",
+    "faker>=33.0.0",
     "pandas>=2.0.3",
     "psycopg2-binary>=2.9.11",
     "splink>=4.0.15",

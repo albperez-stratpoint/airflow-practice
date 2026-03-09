@@ -129,6 +129,8 @@ Open http://localhost:8080 in your browser.
 │   │   ├── sample_df_to_csv_dag.py
 │   │   └── test_env_dag.py
 │   └── plugins/              # Custom Airflow plugins (optional)
+├── scripts/                  # CLI and utility scripts
+│   └── generate.py           # Synthetic entity-resolution data generator
 ├── src/                      # Application code (if needed)
 ├── pipelines/                # Reusable pipeline logic (Python package)
 │   ├── __init__.py
@@ -136,6 +138,112 @@ Open http://localhost:8080 in your browser.
 ├── pyproject.toml            # Package definition for pipelines
 └── docker-compose.yaml       # Local Airflow stack
 ```
+
+## Scripts
+
+### Synthetic data generator (`scripts/generate.py`)
+
+Generates synthetic customer-like data for **entity resolution** across multiple source systems. Output is written as partitioned CSVs with intentional noise (typos, transpositions, extra characters) in name, email, and address so you can test matching and deduplication (e.g. with Splink).
+
+**Usage**
+
+```bash
+uv run python scripts/generate.py [OPTIONS]
+```
+
+| Option | Default | Description |
+|--------|--------|-------------|
+| `--output-dir` | `data/raw` | Base directory for partition folders |
+| `--date` | today | Start date (`YYYYMMDD`) |
+| `--days` | `2` | Number of consecutive days (partitions) to generate |
+| `--sources` | `crm,ticketing,support,billing,marketing` | Comma-separated source system names |
+| `--num-entities` | `200` | Number of canonical entities to generate |
+| `--noise` | `0.25` | Probability of noise per field (0–1) |
+| `--master-source` | `crm` | Source that **owns** address updates across days |
+| `--master-change-prob` | `0.3` | Daily probability that the master source changes an entity’s address |
+| `--seed` | — | Random seed for reproducible runs |
+| `-v`, `--verbose` | — | Enable verbose logging |
+
+**Examples**
+
+```bash
+# Default: 200 entities, 5 sources, today’s date
+uv run python scripts/generate.py
+
+# Smaller run with fixed seed and specific date
+uv run python scripts/generate.py --num-entities 50 --seed 42 --date 20250306
+
+# Custom sources and higher noise
+uv run python scripts/generate.py --sources "crm,zendesk,stripe" --noise 0.4
+```
+
+## Raw data (synthetic entity-resolution)
+
+Data produced by `scripts/generate.py` is written under **partitioned paths** so that one file per source per day is produced. You typically run the generator **once** over a small date range (e.g. 2–7 days) to create a realistic history.
+
+### Folder structure
+
+```
+<output-dir>/
+└── <source>/
+    └── %Y/
+        └── %m/
+            └── %Y%m%d.csv
+```
+
+Example with `--output-dir data/raw` and date `20250306`:
+
+```
+data/raw/
+├── crm/
+│   └── 2025/
+│       └── 03/
+│           └── 20250306.csv
+├── ticketing/
+│   └── 2025/
+│       └── 03/
+│           └── 20250306.csv
+├── support/
+│   └── 2025/
+│       └── 03/
+│           └── 20250306.csv
+├── billing/
+│   └── 2025/
+│       └── 03/
+│           └── 20250306.csv
+└── marketing/
+    └── 2025/
+        └── 03/
+            └── 20250306.csv
+```
+
+### CSV schema
+
+| Column | Description |
+|--------|-------------|
+| `entity_id` | Canonical entity ID (same person across sources); use as ground truth for entity resolution. |
+| `source_system` | Source system name (e.g. `crm`, `ticketing`). |
+| `source_record_id` | Unique record ID within that source and date. |
+| `full_name` | Full name; may contain noise (deletions, transpositions, extra chars). |
+| `email` | Email; may contain noise. |
+| `address` | Single-line address; may contain noise. |
+| `phone` | Phone number (no noise applied). |
+| `created_at` | ISO timestamp; use the **latest** per `entity_id` (and optionally per `source_system`) as the current/master record. |
+
+### Noise applied
+
+To simulate real-world data quality, the script applies (with configurable probability) to **name**, **email**, and **address** only:
+
+- **Deletion** – one random character removed.
+- **Transposition** – two adjacent characters swapped.
+- **Insertion** – one extra character (duplicate or keyboard-neighbor typo).
+
+The same logical entity can appear in multiple sources with different noise, so you can validate that entity resolution correctly links records across systems.
+
+For the configured **master source** (default: `crm`), some entities will have **multiple address versions** within the same partition file (different `created_at` and sometimes different `address` values). This lets you model scenarios like:
+
+- An old address for a customer (e.g. *Nicole Burton*) being updated multiple times.
+- Many historical addresses in the raw data, while downstream logic **always picks the latest `created_at`** from the master source as the authoritative address.
 
 ## Local Development
 
