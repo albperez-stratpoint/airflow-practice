@@ -1,5 +1,3 @@
-"""Run Splink deduplication and produce customer master records."""
-
 from __future__ import annotations
 
 import logging
@@ -10,37 +8,35 @@ import pandas as pd
 from splink import DuckDBAPI, Linker
 
 from mdm.splink_settings import (
-    CITY_COLUMN,
-    CUSTOMER_UNIQUE_ID_COLUMN,
-    STATE_COLUMN,
-    ZIP_COLUMN,
+    ADDRESS_COLUMN,
+    EMAIL_COLUMN,
+    FULL_NAME_COLUMN,
+    UNIQUE_ID_COLUMN,
     get_splink_settings,
 )
 
 logger = logging.getLogger(__name__)
 
-# Match probability threshold for clustering (pairs above this are same entity).
-DEFAULT_MATCH_PROBABILITY_THRESHOLD = 0.5
-
-# Max pairs for u-probability random sampling; lower value reduces memory use (e.g. in Docker).
+# Lower threshold = more pairs clustered (fewer master records). 0.4 balances recall vs false merges.
+DEFAULT_MATCH_PROBABILITY_THRESHOLD = 0.4
 U_ESTIMATION_MAX_PAIRS = 100_000
 
 
-def run_deduplication(
+def run_entity_deduplication(
     staging_df: pd.DataFrame,
     match_probability_threshold: float = DEFAULT_MATCH_PROBABILITY_THRESHOLD,
 ) -> list[dict[str, Any]]:
-    """Run Splink deduplication on staging data and return master records.
+    """Run Splink deduplication on entity staging and return master records.
 
     Args:
-        staging_df: DataFrame with columns customer_id, customer_unique_id,
-            zip_code_prefix, city, state (and optionally source_system).
+        staging_df: DataFrame with columns source_record_id, full_name, email, address
+            (and optionally source_system, entity_id, phone, created_at).
         match_probability_threshold: Pairs with match_probability >= this
             are clustered as the same entity.
 
     Returns:
-        List of dicts suitable for ecommerce_customer_master: master_customer_id,
-        customer_unique_id, zip_code_prefix, city, state, source_count.
+        List of dicts for entity_master: master_entity_id, full_name, email,
+        address, source_count.
     """
     if staging_df.empty:
         logger.warning("Staging dataframe is empty; returning no master records.")
@@ -48,7 +44,7 @@ def run_deduplication(
 
     num_staging = len(staging_df)
     logger.info(
-        "Starting deduplication: %d staging rows, match_threshold=%.2f",
+        "Starting entity deduplication: %d staging rows, match_threshold=%.2f",
         num_staging,
         match_probability_threshold,
     )
@@ -58,14 +54,11 @@ def run_deduplication(
     linker = Linker(staging_df, settings, db_api=db_api)
     logger.info("Linker created with DuckDB backend")
 
-    # Optionally improve u probabilities; fixed m/u in settings are used otherwise.
-    # Use a moderate sample to avoid OOM in constrained environments (e.g. Docker).
     linker.training.estimate_u_using_random_sampling(max_pairs=U_ESTIMATION_MAX_PAIRS)
     logger.info("U probabilities estimated (max_pairs=%d)", U_ESTIMATION_MAX_PAIRS)
 
     predictions = linker.inference.predict(threshold_match_probability=match_probability_threshold)
 
-    # Avoid materializing full predictions table; check count via SQL to save memory.
     count_df = linker.misc.query_sql(f"SELECT COUNT(*) AS n FROM {predictions.physical_name}")
     num_pairs = int(count_df["n"].iloc[0])
     logger.info("Pairwise predictions generated: %d pairs", num_pairs)
@@ -77,52 +70,44 @@ def run_deduplication(
         )
         return _staging_rows_to_master_records(staging_df)
 
-    unique_id_col = settings["unique_id_column_name"]
-
-    # Use linker's clustering method (Splink 4 API).
     clusters_sdf = linker.clustering.cluster_pairwise_predictions_at_threshold(
         predictions, threshold_match_probability=match_probability_threshold
     )
     clusters_df = clusters_sdf.as_pandas_dataframe()
     logger.info("Clustering completed: %d cluster assignments", len(clusters_df))
 
-    # Detect cluster id column name (Splink may use different naming).
     cluster_id_col = "cluster_id"
     if "cluster_id" not in clusters_df.columns:
-        other_cols = [c for c in clusters_df.columns if c != unique_id_col]
+        other_cols = [c for c in clusters_df.columns if c != UNIQUE_ID_COLUMN]
         cluster_id_col = other_cols[0] if other_cols else "cluster_id"
 
-    # Ensure all nodes have a cluster (singletons may be missing from clusters_df).
-    all_ids = staging_df[unique_id_col].drop_duplicates()
+    all_ids = staging_df[UNIQUE_ID_COLUMN].drop_duplicates()
     if len(clusters_df) < len(all_ids):
-        clustered_ids = set(clusters_df[unique_id_col])
+        clustered_ids = set(clusters_df[UNIQUE_ID_COLUMN])
         singleton_ids = all_ids[~all_ids.isin(clustered_ids)]
         num_singletons = len(singleton_ids)
         logger.info("Adding %d singletons not present in clustering result", num_singletons)
         next_id = int(clusters_df[cluster_id_col].max()) + 1
         singletons_df = pd.DataFrame(
             {
-                unique_id_col: singleton_ids,
+                UNIQUE_ID_COLUMN: singleton_ids,
                 cluster_id_col: range(next_id, next_id + len(singleton_ids)),
             }
         )
         clusters_df = pd.concat([clusters_df, singletons_df], ignore_index=True)
 
-    # One master record per cluster: pick representative row, set source_count.
     master_records: list[dict[str, Any]] = []
     for cluster_id, group in clusters_df.groupby(cluster_id_col, sort=False):
-        ids_in_cluster = group[unique_id_col].tolist()
+        ids_in_cluster = group[UNIQUE_ID_COLUMN].tolist()
         source_count = len(ids_in_cluster)
-        # Representative row: first row from staging that belongs to this cluster.
-        mask = staging_df[unique_id_col].isin(ids_in_cluster)
+        mask = staging_df[UNIQUE_ID_COLUMN].isin(ids_in_cluster)
         rep_row = staging_df.loc[mask].iloc[0]
         master_records.append(
             {
-                "master_customer_id": uuid.uuid4(),
-                "customer_unique_id": rep_row.get(CUSTOMER_UNIQUE_ID_COLUMN),
-                "zip_code_prefix": rep_row.get(ZIP_COLUMN),
-                "city": rep_row.get(CITY_COLUMN),
-                "state": rep_row.get(STATE_COLUMN),
+                "master_entity_id": uuid.uuid4(),
+                "full_name": rep_row.get(FULL_NAME_COLUMN),
+                "email": rep_row.get(EMAIL_COLUMN),
+                "address": rep_row.get(ADDRESS_COLUMN),
                 "source_count": source_count,
             }
         )
@@ -130,7 +115,7 @@ def run_deduplication(
     num_clusters = len(master_records)
     num_merged = sum(1 for r in master_records if r["source_count"] > 1)
     logger.info(
-        "Deduplication complete: %d master records (%d clusters with multiple sources)",
+        "Entity deduplication complete: %d master records (%d clusters with multiple sources)",
         num_clusters,
         num_merged,
     )
@@ -145,11 +130,10 @@ def _staging_rows_to_master_records(staging_df: pd.DataFrame) -> list[dict[str, 
     )
     return [
         {
-            "master_customer_id": uuid.uuid4(),
-            "customer_unique_id": getattr(row, CUSTOMER_UNIQUE_ID_COLUMN),
-            "zip_code_prefix": getattr(row, ZIP_COLUMN),
-            "city": getattr(row, CITY_COLUMN),
-            "state": getattr(row, STATE_COLUMN),
+            "master_entity_id": uuid.uuid4(),
+            "full_name": getattr(row, FULL_NAME_COLUMN),
+            "email": getattr(row, EMAIL_COLUMN),
+            "address": getattr(row, ADDRESS_COLUMN),
             "source_count": 1,
         }
         for row in staging_df.itertuples(index=False)
