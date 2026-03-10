@@ -37,20 +37,26 @@ uv venv --python 3.8.18
 
 ### 3. Get official docker-compose file for Airflow 2.8.3
 
+> Note: This repo already includes a compose file at `local/docker-compose.yaml`.  
+> The following step is only needed if you want to refresh it from upstream.
+
 ```bash
 curl -LfO 'https://airflow.apache.org/docs/apache-airflow/2.8.3/docker-compose.yaml'
+mv docker-compose.yaml local/docker-compose.yaml
 ```
 
 Optionally set `AIRFLOW__CORE__LOAD_EXAMPLES: 'false'` in the compose file to disable example DAGs.
 
-We will also use custom image so we need do the follow:
+We will also use a custom image so we need to do the following in `local/docker-compose.yaml` (already applied in this repo):
 
 ```yaml
 # Comment this
 # image: ${AIRFLOW_IMAGE_NAME:-apache/airflow:2.8.3}
 
-# Uncomment this
-build: .
+# Uncomment/ensure this block exists
+build:
+  context: ..
+  dockerfile: local/Dockerfile
 ```
 
 We do this since we need to add additional dependencies, though we could populate `    _PIP_ADDITIONAL_REQUIREMENTS: ${_PIP_ADDITIONAL_REQUIREMENTS:-}`.
@@ -69,18 +75,43 @@ echo -e "AIRFLOW_UID=$(id -u)" >> .env
 
 ### 6. Start Airflow
 
+From the project root:
+
 ```bash
-docker compose up -d
+make up
+```
+
+Or manually:
+
+```bash
+docker compose --env-file .env -f local/docker-compose.yaml up -d
 ```
 
 ### 7. Reuse postgres service for data warehouse
 
-Create a separate `dwh` database and schema so the DAG can create staging tables. Set the connection in `.env` (see end of step).
+Create a separate `dwh` database and schema so the DAG can create staging tables.
+
+**Option A – Run the setup script (recommended)**
+
+With the stack running (`make up`), from the project root:
 
 ```bash
-# 0. Connect to the existing PostgreSQL container
-docker compose exec postgres psql -U airflow
+make setup-dwh
+```
 
+This runs `scripts/setup_dwh.sh`, which executes the SQL below inside the postgres container. Ensure `.env` contains the DWH connection (see end of step).
+
+**Option B – Run the SQL manually**
+
+Connect to the existing PostgreSQL container and run the statements yourself:
+
+```bash
+docker compose -f local/docker-compose.yaml exec postgres psql -U airflow -d airflow
+```
+
+Then in the `psql` prompt:
+
+```sql
 -- 1. Create a separate database for the DWH
 CREATE DATABASE dwh;
 
@@ -129,7 +160,7 @@ Use when raw files already exist for a date (e.g. you ran `scripts/generate.py` 
 
 ```bash
 # Run the DAG for a single date (use a date you have data for)
-docker compose exec airflow-scheduler airflow dags backfill raw_mdm_reconcile -s 2025-01-06 -e 2025-01-06
+docker compose -f local/docker-compose.yaml exec airflow-scheduler airflow dags backfill raw_mdm_reconcile -s 2025-01-06 -e 2025-01-06
 ```
 
 **Option B – Trigger the DAG manually**
@@ -149,7 +180,7 @@ Connect to Postgres and inspect the DWH schema and tables:
 
 ```bash
 # 1. Open a psql session in the postgres container (connects to the dwh database)
-docker compose exec postgres psql -U dwh_user -d dwh
+docker compose -f local/docker-compose.yaml exec postgres psql -U dwh_user -d dwh
 ```
 
 In the `psql` prompt:
@@ -174,11 +205,26 @@ Exit with `\q`.
 **One-liner from the host (no interactive psql):**
 
 ```bash
-docker compose exec postgres psql -U dwh_user -d dwh -c "\dt dwh.*"
-docker compose exec postgres psql -U dwh_user -d dwh -c "SELECT count(*) FROM dwh.entity_master;"
+docker compose -f local/docker-compose.yaml exec postgres psql -U dwh_user -d dwh -c "\dt dwh.*"
+docker compose -f local/docker-compose.yaml exec postgres psql -U dwh_user -d dwh -c "SELECT count(*) FROM dwh.entity_master;"
 ```
 
 You can also use the helper script from the project root: `./scripts/check_dwh_psql.sh` (ensure `PGUSER`/`PGDATABASE` match your setup, or adjust the script to use `dwh_user` and `dwh` if you use the separate DWH database).
+
+## Makefile targets
+
+Run from the project root. Compose commands use `--env-file .env -f local/docker-compose.yaml`.
+
+| Target | Description |
+|--------|-------------|
+| `make up` | Start the Airflow stack in the background |
+| `make down` | Stop the stack |
+| `make build` | Build Docker images |
+| `make logs` | Stream logs from all services |
+| `make ps` | List running services |
+| `make setup-dwh` | Create DWH database, user, and schema (step 7) |
+| `make psql` | Open psql in postgres container (airflow DB) |
+| `make lint` | Run ruff (imports, format, fix) |
 
 ## Project Structure
 
@@ -194,6 +240,7 @@ You can also use the helper script from the project root: `./scripts/check_dwh_p
 │   ├── deduplicate.py
 │   └── splink_settings.py
 ├── scripts/                  # CLI and utility scripts
+│   ├── setup_dwh.sh          # Create DWH database/user/schema (make setup-dwh)
 │   ├── check_dwh_psql.sh     # Verify staging/master via docker exec
 │   └── generate.py           # Synthetic entity-resolution data generator
 ├── src/                      # Application code (if needed)
@@ -201,10 +248,22 @@ You can also use the helper script from the project root: `./scripts/check_dwh_p
 │   ├── __init__.py
 │   └── df_to_csv.py
 ├── pyproject.toml            # Package definition for pipelines
-└── docker-compose.yaml       # Local Airflow stack
+└── local/
+    ├── docker-compose.yaml   # Local Airflow stack
+    └── Dockerfile            # Custom Airflow image
 ```
 
 ## Scripts
+
+### DWH setup (`scripts/setup_dwh.sh`)
+
+Creates the `dwh` database, `dwh_user`, and `dwh` schema in the postgres container (Quick Start step 7). Run with:
+
+```bash
+make setup-dwh
+```
+
+Requires the stack to be up (`make up`). After running, ensure `.env` contains `AIRFLOW_CONN_POSTGRES_DWH=postgresql://dwh_user:dwh_pass@postgres:5432/dwh?options=-csearch_path%3Ddwh`.
 
 ### Synthetic data generator (`scripts/generate.py`)
 
