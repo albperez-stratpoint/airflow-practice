@@ -200,30 +200,6 @@ def _comparison_phone() -> dict:
     }
 
 
-def get_splink_settings() -> dict:
-    """Return Splink settings for entity deduplication (full_name, email, address).
-
-    Blocking on email prefix, name prefix, and address prefix so same-address
-    records (e.g. AAmanda vs Amanda) are compared. Comparisons: exact, Jaro-Winkler
-    fuzzy (typos), else. DuckDB SQL dialect.
-    """
-    return {
-        "link_type": "dedupe_only",
-        "unique_id_column_name": UNIQUE_ID_COLUMN,
-        "sql_dialect": "duckdb",
-        "blocking_rules_to_generate_predictions": [
-            _blocking_rule_email_prefix(),
-            _blocking_rule_name_prefix(),
-            _blocking_rule_address_prefix(),
-        ],
-        "comparisons": [
-            _comparison_full_name(),
-            _comparison_email(),
-            _comparison_address(),
-        ],
-    }
-
-
 # Stricter blocking for MDM (60k+ rows): longer prefixes to reduce candidate pairs and avoid OOM.
 MDM_EMAIL_PREFIX_CHARS = 8
 MDM_NAME_PREFIX_CHARS = 5
@@ -233,10 +209,9 @@ MDM_ADDRESS_PREFIX_CHARS = 18
 def get_splink_settings_mdm() -> dict:
     """Return Splink settings for MDM pipeline (full_name, email, phone, address).
 
-    Same as get_splink_settings but adds phone comparison and phone_suffix blocking.
-    Expects staging to have phone_suffix column (last N digits of phone).
-    Uses only email (8-char prefix) + phone_suffix blocking to minimise candidate
+    Blocking on email prefix (8 chars) and phone_suffix to minimise candidate
     pairs and avoid OOM; name/address are still compared within blocks.
+    Expects staging to have phone_suffix column (last N digits of phone).
     """
     return {
         "link_type": "dedupe_only",
