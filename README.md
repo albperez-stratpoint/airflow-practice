@@ -119,17 +119,82 @@ Open http://localhost:8080 in your browser.
 - Username: `airflow`
 - Password: `airflow`
 
+### 9. Run the MDM DAG and verify master data
+
+The **raw_mdm_reconcile** DAG reads partitioned raw CSVs for a given **logical date** and writes deduplicated master records to the DWH. You can run it in two ways:
+
+**Option A – Backfill for a specific date (recommended when you already have data)**
+
+Use when raw files already exist for a date (e.g. you ran `scripts/generate.py` for that day):
+
+```bash
+# Run the DAG for a single date (use a date you have data for)
+docker compose exec airflow-scheduler airflow dags backfill raw_mdm_reconcile -s 2025-01-06 -e 2025-01-06
+```
+
+**Option B – Trigger the DAG manually**
+
+If you trigger the DAG from the Airflow UI, the logical date is **today**. Ensure raw data for **today** exists first:
+
+```bash
+# Generate data for today so the DAG finds files under data/raw/<source>/YYYY/MM/YYYYMMDD.csv
+uv run python scripts/generate.py --date $(date +%Y%m%d) --days 1
+```
+
+Then trigger **raw_mdm_reconcile** in the UI. If you don’t generate data for the run date, the `validate_raw_headers` task will fail with “Missing: …”.
+
+**Verify master data via Docker exec**
+
+Connect to Postgres and inspect the DWH schema and tables:
+
+```bash
+# 1. Open a psql session in the postgres container (connects to the dwh database)
+docker compose exec postgres psql -U dwh_user -d dwh
+```
+
+In the `psql` prompt:
+
+```sql
+-- 2. List tables in the dwh schema
+\dt dwh.*
+
+-- 3. Row counts for staging and master
+SELECT 'entity_staging' AS table_name, count(*) FROM dwh.entity_staging
+UNION ALL
+SELECT 'entity_master', count(*) FROM dwh.entity_master;
+
+-- 4. Sample master records
+SELECT master_entity_id, full_name, email, address, source_count, created_at
+FROM dwh.entity_master
+LIMIT 10;
+```
+
+Exit with `\q`.
+
+**One-liner from the host (no interactive psql):**
+
+```bash
+docker compose exec postgres psql -U dwh_user -d dwh -c "\dt dwh.*"
+docker compose exec postgres psql -U dwh_user -d dwh -c "SELECT count(*) FROM dwh.entity_master;"
+```
+
+You can also use the helper script from the project root: `./scripts/check_dwh_psql.sh` (ensure `PGUSER`/`PGDATABASE` match your setup, or adjust the script to use `dwh_user` and `dwh` if you use the separate DWH database).
+
 ## Project Structure
 
 ```
 .
 ├── airflow/
 │   ├── dags/                 # Airflow DAG definitions
-│   │   ├── customer_dag.py
+│   │   ├── raw_mdm_dag.py    # Raw → staging → Splink → master (MDM)
 │   │   ├── sample_df_to_csv_dag.py
 │   │   └── test_env_dag.py
 │   └── plugins/              # Custom Airflow plugins (optional)
+├── mdm/                      # Splink deduplication and settings
+│   ├── deduplicate.py
+│   └── splink_settings.py
 ├── scripts/                  # CLI and utility scripts
+│   ├── check_dwh_psql.sh     # Verify staging/master via docker exec
 │   └── generate.py           # Synthetic entity-resolution data generator
 ├── src/                      # Application code (if needed)
 ├── pipelines/                # Reusable pipeline logic (Python package)
