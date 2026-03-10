@@ -6,15 +6,15 @@ A local development setup for Apache Airflow with a clean separation between DAG
 
 This project demonstrates a production-ready Airflow project structure:
 
-- **`dags/`** - Contains Airflow DAG definitions (orchestration layer)
-- **`pipelines/`** - Contains reusable pipeline logic (business logic layer), packaged as a Python module
+- **`airflow/dags/`** – Airflow DAG definitions (orchestration)
+- **`mdm/`** – Reusable MDM logic (normalize, Splink deduplication, golden records)
 
 ## Development vs Deployment
 
-| Environment | `pipelines/` Setup |
-|-------------|-------------------|
-| **Local Dev** | Mounted as volume + added to `PYTHONPATH` via docker-compose |
-| **AWS MWAA** | Built as wheel from `pyproject.toml` and installed via `requirements.txt` |
+| Environment | `mdm/` setup |
+|-------------|---------------|
+| **Local Dev** | Mounted at `/opt/airflow/mdm` and on `PYTHONPATH` via docker-compose |
+| **AWS MWAA** | Upload `mdm/` into the DAGs prefix so workers can import it (see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)) |
 
 ## Prerequisites
 
@@ -152,15 +152,15 @@ Open http://localhost:8080 in your browser.
 
 ### 9. Run the MDM DAG and verify master data
 
-The **raw_mdm_reconcile** DAG reads partitioned raw CSVs for a given **logical date** and writes deduplicated master records to the DWH. You can run it in two ways:
+The **mdm_golden_records** DAG reads partitioned raw CSVs (CRM, Billing, Support) for a given **logical date** and writes deduplicated golden records to the DWH. You can run it in two ways:
 
 **Option A – Backfill for a specific date (recommended when you already have data)**
 
-Use when raw files already exist for a date (e.g. you ran `scripts/generate.py` for that day):
+Use when raw files already exist for a date (e.g. you ran `scripts/generate_mdm_synthetic.py` for that day):
 
 ```bash
 # Run the DAG for a single date (use a date you have data for)
-docker compose -f local/docker-compose.yaml exec airflow-scheduler airflow dags backfill raw_mdm_reconcile -s 2025-01-06 -e 2025-01-06
+docker compose -f local/docker-compose.yaml exec airflow-scheduler airflow dags backfill mdm_golden_records -s 2025-01-06 -e 2025-01-06
 ```
 
 **Option B – Trigger the DAG manually**
@@ -169,10 +169,10 @@ If you trigger the DAG from the Airflow UI, the logical date is **today**. Ensur
 
 ```bash
 # Generate data for today so the DAG finds files under data/raw/<source>/YYYY/MM/YYYYMMDD.csv
-uv run python scripts/generate.py --date $(date +%Y%m%d) --days 1
+uv run python scripts/generate_mdm_synthetic.py --date $(date +%Y%m%d) --days 1
 ```
 
-Then trigger **raw_mdm_reconcile** in the UI. If you don’t generate data for the run date, the `validate_raw_headers` task will fail with “Missing: …”.
+Then trigger **mdm_golden_records** in the UI. If you don’t generate data for the run date, the `validate_mdm_raw_headers` task will fail with “Missing: …”.
 
 **Verify master data via Docker exec**
 
@@ -189,14 +189,14 @@ In the `psql` prompt:
 -- 2. List tables in the dwh schema
 \dt dwh.*
 
--- 3. Row counts for staging and master
-SELECT 'entity_staging' AS table_name, count(*) FROM dwh.entity_staging
+-- 3. Row counts for golden and crosswalk
+SELECT 'mdm_customers' AS table_name, count(*) FROM dwh.mdm_customers
 UNION ALL
-SELECT 'entity_master', count(*) FROM dwh.entity_master;
+SELECT 'mdm_customer_crosswalk', count(*) FROM dwh.mdm_customer_crosswalk;
 
--- 4. Sample master records
-SELECT master_entity_id, full_name, email, address, source_count, created_at
-FROM dwh.entity_master
+-- 4. Sample golden records
+SELECT mdm_customer_id, golden_name, golden_email, golden_address
+FROM dwh.mdm_customers
 LIMIT 10;
 ```
 
@@ -206,10 +206,10 @@ Exit with `\q`.
 
 ```bash
 docker compose -f local/docker-compose.yaml exec postgres psql -U dwh_user -d dwh -c "\dt dwh.*"
-docker compose -f local/docker-compose.yaml exec postgres psql -U dwh_user -d dwh -c "SELECT count(*) FROM dwh.entity_master;"
+docker compose -f local/docker-compose.yaml exec postgres psql -U dwh_user -d dwh -c "SELECT count(*) FROM dwh.mdm_customers;"
 ```
 
-You can also use the helper script from the project root: `./scripts/check_dwh_psql.sh` (ensure `PGUSER`/`PGDATABASE` match your setup, or adjust the script to use `dwh_user` and `dwh` if you use the separate DWH database).
+You can run similar queries from the host using `docker compose ... exec postgres psql` as in the one-liners above.
 
 ## Makefile targets
 
@@ -232,22 +232,20 @@ Run from the project root. Compose commands use `--env-file .env -f local/docker
 .
 ├── airflow/
 │   ├── dags/                 # Airflow DAG definitions
-│   │   ├── raw_mdm_dag.py    # Raw → staging → Splink → master (MDM)
-│   │   ├── sample_df_to_csv_dag.py
-│   │   └── test_env_dag.py
+│   │   └── mdm_golden_dag.py # CRM/Billing/Support → normalize → Splink → golden records
 │   └── plugins/              # Custom Airflow plugins (optional)
-├── mdm/                      # Splink deduplication and settings
-│   ├── deduplicate.py
+├── mdm/                      # MDM business logic (Splink, normalize, golden record)
+│   ├── deduplicate_mdm.py
+│   ├── normalize_raw.py
+│   ├── golden_record.py
 │   └── splink_settings.py
-├── scripts/                  # CLI and utility scripts
+├── scripts/
 │   ├── setup_dwh.sh          # Create DWH database/user/schema (make setup-dwh)
-│   ├── check_dwh_psql.sh     # Verify staging/master via docker exec
-│   └── generate.py           # Synthetic entity-resolution data generator
-├── src/                      # Application code (if needed)
-├── pipelines/                # Reusable pipeline logic (Python package)
-│   ├── __init__.py
-│   └── df_to_csv.py
-├── pyproject.toml            # Package definition for pipelines
+│   └── generate_mdm_synthetic.py  # Synthetic CRM/Billing/Support CSVs per docs/SCENARIO.md
+├── pyproject.toml            # Dependencies (pandas, splink, psycopg2, etc.)
+├── docs/
+│   ├── DEPLOYMENT.md         # AWS MWAA deployment guide
+│   └── SCENARIO.md           # MDM synthetic dataset specification
 └── local/
     ├── docker-compose.yaml   # Local Airflow stack
     └── Dockerfile            # Custom Airflow image
@@ -265,45 +263,21 @@ make setup-dwh
 
 Requires the stack to be up (`make up`). After running, ensure `.env` contains `AIRFLOW_CONN_POSTGRES_DWH=postgresql://dwh_user:dwh_pass@postgres:5432/dwh?options=-csearch_path%3Ddwh`.
 
-### Synthetic data generator (`scripts/generate.py`)
+### Synthetic data generator (`scripts/generate_mdm_synthetic.py`)
 
-Generates synthetic customer-like data for **entity resolution** across multiple source systems. Output is written as partitioned CSVs with intentional noise (typos, transpositions, extra characters) in name, email, and address so you can test matching and deduplication (e.g. with Splink).
+Generates synthetic CRM, Billing, and Support CSVs per [docs/SCENARIO.md](docs/SCENARIO.md) for MDM (entity resolution, golden records). Output: `data/raw/{crm,billing,support}/%Y/%m/%Y%m%d.csv`.
 
 **Usage**
 
 ```bash
-uv run python scripts/generate.py [OPTIONS]
+uv run python scripts/generate_mdm_synthetic.py [OPTIONS]
 ```
 
-| Option | Default | Description |
-|--------|--------|-------------|
-| `--output-dir` | `data/raw` | Base directory for partition folders |
-| `--date` | today | Start date (`YYYYMMDD`) |
-| `--days` | `2` | Number of consecutive days (partitions) to generate |
-| `--sources` | `crm,ticketing,support,billing,marketing` | Comma-separated source system names |
-| `--num-entities` | `200` | Number of canonical entities to generate |
-| `--noise` | `0.25` | Probability of noise per field (0–1) |
-| `--master-source` | `crm` | Source that **owns** address updates across days |
-| `--master-change-prob` | `0.3` | Daily probability that the master source changes an entity’s address |
-| `--seed` | — | Random seed for reproducible runs |
-| `-v`, `--verbose` | — | Enable verbose logging |
+See the script `--help` for options (e.g. `--output-dir`, `--date`, `--days`). Defaults produce ~20k CRM, ~15k Billing, ~25k Support rows with duplicates and anomalies.
 
-**Examples**
+## Raw data (MDM synthetic)
 
-```bash
-# Default: 200 entities, 5 sources, today’s date
-uv run python scripts/generate.py
-
-# Smaller run with fixed seed and specific date
-uv run python scripts/generate.py --num-entities 50 --seed 42 --date 20250306
-
-# Custom sources and higher noise
-uv run python scripts/generate.py --sources "crm,zendesk,stripe" --noise 0.4
-```
-
-## Raw data (synthetic entity-resolution)
-
-Data produced by `scripts/generate.py` is written under **partitioned paths** so that one file per source per day is produced. You typically run the generator **once** over a small date range (e.g. 2–7 days) to create a realistic history.
+Data produced by `scripts/generate_mdm_synthetic.py` is written under **partitioned paths** per source (CRM, Billing, Support). Schema and anomalies are defined in [docs/SCENARIO.md](docs/SCENARIO.md).
 
 ### Folder structure
 
@@ -320,58 +294,18 @@ Example with `--output-dir data/raw` and date `20250306`:
 ```
 data/raw/
 ├── crm/
-│   └── 2025/
-│       └── 03/
-│           └── 20250306.csv
-├── ticketing/
-│   └── 2025/
-│       └── 03/
-│           └── 20250306.csv
-├── support/
-│   └── 2025/
-│       └── 03/
-│           └── 20250306.csv
+│   └── 2025/03/20250306.csv
 ├── billing/
-│   └── 2025/
-│       └── 03/
-│           └── 20250306.csv
-└── marketing/
-    └── 2025/
-        └── 03/
-            └── 20250306.csv
+│   └── 2025/03/20250306.csv
+└── support/
+    └── 2025/03/20250306.csv
 ```
 
-### CSV schema
-
-| Column | Description |
-|--------|-------------|
-| `entity_id` | Canonical entity ID (same person across sources); use as ground truth for entity resolution. |
-| `source_system` | Source system name (e.g. `crm`, `ticketing`). |
-| `source_record_id` | Unique record ID within that source and date. |
-| `full_name` | Full name; may contain noise (deletions, transpositions, extra chars). |
-| `email` | Email; may contain noise. |
-| `address` | Single-line address; may contain noise. |
-| `phone` | Phone number (no noise applied). |
-| `created_at` | ISO timestamp; use the **latest** per `entity_id` (and optionally per `source_system`) as the current/master record. |
-
-### Noise applied
-
-To simulate real-world data quality, the script applies (with configurable probability) to **name**, **email**, and **address** only:
-
-- **Deletion** – one random character removed.
-- **Transposition** – two adjacent characters swapped.
-- **Insertion** – one extra character (duplicate or keyboard-neighbor typo).
-
-The same logical entity can appear in multiple sources with different noise, so you can validate that entity resolution correctly links records across systems.
-
-For the configured **master source** (default: `crm`), some entities will have **multiple address versions** within the same partition file (different `created_at` and sometimes different `address` values). This lets you model scenarios like:
-
-- An old address for a customer (e.g. *Nicole Burton*) being updated multiple times.
-- Many historical addresses in the raw data, while downstream logic **always picks the latest `created_at`** from the master source as the authoritative address.
+Column sets match the DAG’s expected headers (see `mdm_golden_dag.py` and docs/SCENARIO.md). The DAG validates headers and then normalizes, deduplicates with Splink, and writes `dwh.mdm_customers` and `dwh.mdm_customer_crosswalk`.
 
 ## Local Development
 
-The `pipelines/` directory is mounted as a volume at `/opt/airflow/pipelines` in the containers, and the `PYTHONPATH` is configured to make the package discoverable. This allows you to edit pipeline code and see changes immediately without rebuilding images.
+The `mdm/` directory is mounted at `/opt/airflow/mdm` in the containers and is on `PYTHONPATH`, so you can edit code in `mdm/` and see changes without rebuilding images.
 
 ### Linting
 
@@ -385,19 +319,6 @@ This runs `ruff` to check and auto-fix imports, format code, and fix linting iss
 
 A linting check is also enforced in CI on every push and pull request.
 
-## AWS MWAA Deployment (NOT YET TESTED)
+## AWS MWAA Deployment
 
-For production deployment to AWS MWAA:
-
-1. Build the `pipelines` package as a wheel:
-   ```bash
-   uv build --wheel
-   ```
-
-2. Upload the generated wheel (in `dist/`) to your MWAA S3 bucket
-
-3. Add the wheel to your `requirements.txt`:
-   ```
-   --find-links /usr/local/airflow/dags/wheels
-   pipelines==0.1.0
-   ```
+For a step-by-step guide to deploying this project to **AWS MWAA** (including how to upload the synthetic raw data to S3 and wire it into the `mdm_golden_records` DAG), see **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)**.
